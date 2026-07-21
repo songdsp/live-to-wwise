@@ -24,10 +24,10 @@ Live and Wwise run on the same machine — the extension talks to
 
 ## Get Started
 
-**Install to Live** 
+### Install to Live
 Download [Release](https://github.com/songdsp/live-to-wwise/releases/tag/Installer) and install in Ableton Settings - Extension.
 
-**Build**
+###Build
 ```bash
 npm install          # installs the vendored SDK + CLI from ./vendor
 npm start            # dev build + launch in the Extension Host (extensions-cli run)
