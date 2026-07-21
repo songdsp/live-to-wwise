@@ -75,24 +75,27 @@ Proved the extension host can reach WAAPI end-to-end. See
 - Stage C: WAMP HELLO→WELCOME, then `ak.wwise.core.getInfo` round-trip.
 - Confirm `renderPreFxAudio` output format and constraints.
 
-### Phase 1 — MVP: "Send clip to Wwise" 🚧 *(current)*
+### Phase 1 — MVP: "Send clip to Wwise" ✅ *(done)*
 - Connect panel: host/port, test connection, persist to `storageDirectory`. ✅
-- Single audio-clip transfer from the `AudioClip` context menu → `audio.import` as `<Sound SFX>`. ✅
-  (MVP imports `AudioClip.filePath`; region/FX render deferred to Phase 2/3.)
+- Single audio-clip transfer → `audio.import` as `<Sound SFX>`. ✅
+  (Imports `AudioClip.filePath`; region/FX render deferred to Phase 3. The
+  single-clip menu entry was later folded into the batch flow, which handles one clip.)
 - Import-operation choice; progress via `withinProgressDialog`; deep-link into Wwise via `ui.commands.execute`. ✅
-- End-to-end verification in Live + Wwise. ⬜
+- End-to-end verification in Live + Wwise. ✅
 
-### Phase 2a — Batch, rename-in-Live & destination picker *(next)*
+### Phase 2a — Batch, rename-in-Live & destination picker ✅ *(done)*
 See [phase-2a-batch-and-destination.md](./phase-2a-batch-and-destination.md).
 - Batch transfer over `ClipSlotSelection` / `ArrangementSelection`.
 - Rename clips **in Ableton first** (`Clip.name`, one undo step) → name flows to Wwise.
 - Wwise destination dropdown from `ak.wwise.core.object.get` (WAQL), cached + free-text fallback.
 
 ### Phase 2b — Hierarchy mapping, preview & containers
-- Hierarchy Mapping Table with tokens (`$track`, `$clip`, `$scene`, `$color`, `$group`) → type-tagged `objectPath`.
-- Preview panel (files + objects to be created/replaced) before commit.
-- Originals subfolder; named presets.
-- Container templates (Random/Sequence/Switch/Blend) via `object.create`.
+- ~~Hierarchy Mapping Table with tokens~~ *(descoped — batch rename covers naming)*.
+- ~~Preview panel before commit~~ *(descoped)*.
+- ~~Originals subfolder; named presets~~ *(descoped)*.
+- **Container templates (Random/Sequence/Switch/Blend)** ✅ — a type-tagged
+  `\<… Container>Name` segment in the import `objectPath`; `audio.import`
+  find-or-creates the container and collects the batch inside it.
 
 ### Phase 3 — Metadata-rich transfer
 - Notes with source track/clip/tempo/warp info.
@@ -108,6 +111,8 @@ See [phase-2a-batch-and-destination.md](./phase-2a-batch-and-destination.md).
 - Scenes → Music Segments; cue points → segment cues; tempo/signature → segment tempo.
 - Per-track stems → Blend/Switch containers.
 - Network transfer to a Wwise on another machine.
+
+
 
 ---
 

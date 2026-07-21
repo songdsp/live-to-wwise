@@ -32,14 +32,19 @@ export const ACTOR_MIXER_ROOT = "\\Actor-Mixer Hierarchy";
  * as `<Sound SFX>` parents. Filters descendants client-side so a WAQL `where`
  * quirk can't fail the whole query.
  */
+/** Structured `object.get` args for "the object at `root` and everything under it". */
+function descendantsQuery(root: string) {
+  // Canonical, version-safe form (works on all Wwise versions, unlike some WAQL selectors).
+  return { from: { path: [root] }, transform: [{ select: ["descendants"] }] };
+}
+
 export async function fetchDestinations(
   client: WaapiClient,
   root: string = ACTOR_MIXER_ROOT,
 ): Promise<WwiseDestination[]> {
-  const waql = `$ "${root}" select this, descendants`;
   const result = await client.call<{ return?: WwiseDestination[] }>(
     "ak.wwise.core.object.get",
-    { waql },
+    descendantsQuery(root),
     { return: ["id", "name", "path", "type"] },
   );
 
@@ -66,10 +71,9 @@ export async function fetchHierarchy(
   client: WaapiClient,
   root: string = ACTOR_MIXER_ROOT,
 ): Promise<WwiseHierarchy> {
-  const waql = `$ "${root}" select this, descendants`;
   const result = await client.call<{ return?: WwiseDestination[] }>(
     "ak.wwise.core.object.get",
-    { waql },
+    descendantsQuery(root),
     { return: ["id", "name", "path", "type"] },
   );
 
@@ -87,19 +91,34 @@ export async function fetchHierarchy(
     }
   }
   destinations.sort((a, b) => a.localeCompare(b));
+  console.log(
+    `[live-to-wwise] hierarchy under "${root}": ${objects.length} objects, ${destinations.length} destinations` +
+    (objects.length && !destinations.length
+      ? ` (types seen: ${[...new Set(objects.map((o) => o.type))].join(", ")})`
+      : ""),
+  );
   return { destinations, childrenByPath };
 }
 
 /**
  * Names of the immediate children of `parentPath`. Used to resume the batch
  * index and pre-flight collisions against the chosen Wwise destination.
+ *
+ * A path that doesn't resolve — e.g. a container about to be created on this
+ * run — makes WAQL raise `ak.wwise.query.invalid_query`. That just means "no
+ * object there yet", so we treat it as no children (index resumes from 0).
  */
 export async function fetchChildNames(client: WaapiClient, parentPath: string): Promise<string[]> {
   const waql = `$ "${parentPath}" select children`;
-  const result = await client.call<{ return?: { name?: string }[] }>(
-    "ak.wwise.core.object.get",
-    { waql },
-    { return: ["name"] },
-  );
-  return (result.return ?? []).map((o) => o.name ?? "").filter((n) => n.length > 0);
+  try {
+    const result = await client.call<{ return?: { name?: string }[] }>(
+      "ak.wwise.core.object.get",
+      { waql },
+      { return: ["name"] },
+    );
+    return (result.return ?? []).map((o) => o.name ?? "").filter((n) => n.length > 0);
+  } catch (err) {
+    if (/invalid_query/.test((err as Error)?.message ?? "")) return [];
+    throw err;
+  }
 }

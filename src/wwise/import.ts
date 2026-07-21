@@ -4,17 +4,39 @@
  */
 
 import type { WaapiClient } from "../waapi/client.js";
-import type { ImportOperation } from "../config.js";
+import type { ContainerSettings, ContainerType, ImportOperation } from "../config.js";
+
+/** Container type → the Wwise object-path type tag that `audio.import` recognizes. */
+const CONTAINER_TAG: Record<Exclude<ContainerType, "none">, string> = {
+  random: "Random Container",
+  sequence: "Sequence Container",
+  switch: "Switch Container",
+  blend: "Blend Container",
+};
 
 export interface TransferRequest {
   /** Absolute path to the audio file to import (WAV/AIFF recommended). */
   audioFile: string;
   /** Wwise parent path, e.g. `\Actor-Mixer Hierarchy\Default Work Unit`. */
   parentPath: string;
+  /** Optional container to find-or-create between `parentPath` and the sound. */
+  container?: ContainerSettings;
   /** Desired Wwise object name (will be sanitized). */
   objectName: string;
   importLanguage: string;
   importOperation: ImportOperation;
+}
+
+/**
+ * The parent path a sound lands under, inserting a type-tagged container segment
+ * when one is configured. `audio.import` auto-creates (or reuses) the container,
+ * so every sound in a batch collects under the same one.
+ */
+export function containerParentPath(parentPath: string, container?: ContainerSettings): string {
+  if (!container || container.type === "none") return parentPath;
+  const name = sanitizeWwiseName(container.name);
+  if (!container.name.trim()) return parentPath;
+  return `${parentPath}\\<${CONTAINER_TAG[container.type]}>${name}`;
 }
 
 export interface ImportedObject {
@@ -45,8 +67,10 @@ export async function transferAudioToWwise(
   req: TransferRequest,
 ): Promise<ImportedObject> {
   const name = sanitizeWwiseName(req.objectName);
-  // Type-tagged path — the `<Sound SFX>` prefix tells Wwise which object to create.
-  const objectPath = `${req.parentPath}\\<Sound SFX>${name}`;
+  // Type-tagged path — the `<Sound SFX>` prefix tells Wwise which object to
+  // create; any container ancestor is auto-created / reused by `audio.import`.
+  const parentPath = containerParentPath(req.parentPath, req.container);
+  const objectPath = `${parentPath}\\<Sound SFX>${name}`;
 
   const result = await client.call<{ objects?: ImportedObject[] }>(
     "ak.wwise.core.audio.import",

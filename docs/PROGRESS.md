@@ -4,6 +4,11 @@ Tracking for [PLAN.md](./PLAN.md). Legend: ✅ done · 🚧 in progress · ⬜ n
 
 _Last updated: 2026-07-21_
 
+> **MVP finished.** Phases 0, 1, and 2 are complete: connectivity, single-clip
+> transfer, batch transfer with rename-in-Live + destination picker + offline
+> cache, and container templates. Phases 3–5 remain as future work. See
+> [README.md](../README.md) for usage.
+
 ## Phase 0 — Connectivity spike ✅
 
 | # | Task | Status | Notes |
@@ -24,27 +29,28 @@ _Last updated: 2026-07-21_
 | 1.4 | Progress + result dialog; reveal in Project Explorer | ✅ | `FindInProjectExplorerSyncGroup1` deep-link (best-effort). |
 | 1.5 | End-to-end run in Live + Wwise | ✅ | Verified by user — import lands and the result dialog returns the Wwise path. |
 
-**How to run:** `npm start`, then in Live right-click an audio clip →
-**"Send to Wwise…"** (or **"Test WAAPI Connection"** for the getInfo diagnostic).
-Wwise must be open with a project and the Authoring API enabled (port 8080).
+**How to run:** `npm start`, then in Live select audio clips (Arrangement time
+selection, or Session clip slots) → right-click → **"Send to Wwise…"**. Wwise
+must be open with a project and the Authoring API enabled (port 8080). _(The
+Phase 1 single-clip `AudioClip` menu item and the WAAPI/destination diagnostics
+were removed for the MVP — the batch flow handles one clip too.)_
 
 **MVP scope note:** transfers the clip's **source file** (`AudioClip.filePath`),
 not the warped/trimmed region or track FX — those need `renderPreFxAudio` (0.D),
 scheduled for Phase 2/3. Non-WAV sources may not import; WAV/AIFF recommended.
 
-## Phase 2a — Batch, rename-in-Live & destination picker 📝 planned
-_Design in [phase-2a-batch-and-destination.md](./phase-2a-batch-and-destination.md).
-Chosen to build before 2b. Not yet implemented; 3 open questions to confirm._
+## Phase 2a — Batch, rename-in-Live & destination picker ✅
+_Design in [phase-2a-batch-and-destination.md](./phase-2a-batch-and-destination.md)._
 
 | # | Task | Status |
 |---|------|--------|
-| 2a.1 | `fetchDestinations` via `object.get`/WAQL, Actor-Mixer scope (reused by 2b) | ✅ |
+| 2a.1 | `fetchDestinations`/`fetchHierarchy` via `object.get` (structured query), Actor-Mixer scope | ✅ |
 | 2a.2 | `AudioTrack.ArrangementSelection` entry → clips overlapping time range | ✅ |
 | 2a.2b | Batch rename naming core (`src/live/rename.ts`, pure + verified) | ✅ |
-| 2a.3 | Batch form: destination datalist + rename controls (prefix/base/suffix) + operation + live preview | ✅ |
-| 2a.4 | Rename-in-Live (transaction) + collision/resume vs Wwise dest + transfer loop + `setNotes` + summary | 🚧 |
-| 2a.5 | `ClipSlotSelection` (Session View) entry | 🚧 |
-| 2a.6 | Cache destinations (`src/wwise/cache.ts`); offline fallback + form banner | 🚧 |
+| 2a.3 | Batch form: destination combobox + rename controls (prefix/base/suffix) + operation + live preview | ✅ |
+| 2a.4 | Rename-in-Live (transaction) + collision/resume vs Wwise dest + transfer loop + `setNotes` + summary | ✅ |
+| 2a.5 | `ClipSlotSelection` (Session View) entry | ✅ |
+| 2a.6 | Cache destinations (`src/wwise/cache.ts`); offline fallback + form banner | ✅ |
 
 **Decisions:** Arrangement entry first · rename clip/object only (leave Originals
 WAV as-is) + always `setNotes` for provenance · Actor-Mixer destination scope
@@ -101,7 +107,24 @@ deferred (not needed since Wwise never destructively clobbers here).
 resume + collision vs the **Wwise destination**; no two-phase step. The pure
 naming core (2a.2b) is done and verified.
 
-## Phase 2b — Hierarchy mapping, preview & containers ⬜
+## Phase 2b — Hierarchy mapping, preview & containers 🚧 partial
+_Hierarchy mapping + preview panel + presets **descoped** (batch rename is
+solid enough). Only the **container template** was pulled forward onto main._
+
+| # | Task | Status |
+|---|------|--------|
+| 2b.container | Wrap a batch in a Random/Sequence/Switch/Blend container | ✅ |
+
+**Container run:** Arrangement/Session → select clips → **"Send to Wwise…"** →
+in the batch form's **Container** section pick a type (e.g. Random Container) and
+name it → **Transfer**. The `objectPath` gains a `\<Random Container>Name`
+segment, so `audio.import` find-or-creates that one container and every sound in
+the batch collects inside it. Checks: a fresh container numbers from 0; a
+re-run into the same container name resumes after its existing children (the
+collision/resume check targets the container, not the destination); Switch/Blend
+create the container + children (switch/blend assignment is manual in Wwise).
+Selection persists to config.
+
 ## Phase 3 — Metadata-rich transfer ⬜
 ## Phase 4 — Round-trip & sync ⬜
 ## Phase 5 — Music-specific & advanced ⬜
@@ -131,6 +154,20 @@ naming core (2a.2b) is done and verified.
   requested behaviors) and **2b** (mapping table, preview, containers). Building
   2a first: it reuses Phase 1 plumbing and its `object.get`/WAQL destination
   query is a prerequisite 2b also needs.
+- _2026-07-21_ — Destination dropdown: switched the `object.get` from a WAQL
+  `select this, descendants` selector to the structured `{ from: { path }, transform:
+  [{ select: ["descendants"] }] }` form (version-safe; the WAQL selector returned
+  empty). Replaced the `<datalist>` with a custom combobox — WKWebView doesn't
+  reliably open native datalists. Added `~/.live-to-wwise` fallback when the host
+  provides no `storageDirectory`.
+- _2026-07-21_ — **MVP complete.** Descoped 2b's hierarchy-mapping table,
+  preview panel, and presets (batch rename covers naming well enough); pulled
+  **container templates** forward — a type-tagged `\<… Container>Name` segment in
+  the import `objectPath`, so `audio.import` find-or-creates one container and
+  collects the batch inside it. `fetchChildNames` swallows WAQL `invalid_query`
+  (a not-yet-created container has no children → resume from 0). Removed the
+  single-clip `AudioClip` menu entry and the WAAPI/destination **diagnostics**
+  (`testConnection`, `listDestinations`) for the shipped MVP.
 
 ## Open questions
 - Does WAAPI echo `wamp.2.json` and accept realm `realm1` as expected? (resolved if getInfo returned)

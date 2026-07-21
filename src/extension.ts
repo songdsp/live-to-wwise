@@ -5,16 +5,15 @@ import {
   type ArrangementSelection,
   type ClipSlotSelection,
   type ExtensionContext,
-  type Handle,
 } from "@ableton-extensions/sdk";
 import { resolveArrangementClips, resolveClipSlotClips } from "./live/selection.js";
 import { computeBatchNames, resumeIndex, type BatchRenameSettings } from "./live/rename.js";
 import { WaapiClient } from "./waapi/client.js";
-import { loadConfig, saveConfig, type WaapiConfig, type ImportOperation } from "./config.js";
-import { transferAudioToWwise, revealInWwise, setObjectNotes, type ImportedObject } from "./wwise/import.js";
-import { fetchHierarchy, fetchChildNames, fetchDestinations } from "./wwise/hierarchy.js";
+import { loadConfig, saveConfig, type ContainerSettings, type ImportOperation } from "./config.js";
+import { transferAudioToWwise, revealInWwise, setObjectNotes, sanitizeWwiseName } from "./wwise/import.js";
+import { fetchHierarchy, fetchChildNames } from "./wwise/hierarchy.js";
 import { saveHierarchyCache, loadHierarchyCache } from "./wwise/cache.js";
-import { resultDialogUrl, transferFormUrl, batchFormUrl } from "./ui/dialogs.js";
+import { resultDialogUrl, batchFormUrl } from "./ui/dialogs.js";
 
 type Ctx = ExtensionContext<"1.0.0">;
 type Tone = "ok" | "warn" | "error";
@@ -26,130 +25,6 @@ function showResult(ctx: Ctx, title: string, badge: string, tone: Tone, body: st
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"]/g, (c) =>
     c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;");
-}
-
-function baseName(path: string): string {
-  const m = /[^/\\]+$/.exec(path);
-  return m ? m[0] : path;
-}
-
-/** Phase 1 — transfer a single audio clip's source file to Wwise. */
-async function sendClip(ctx: Ctx, handle: Handle): Promise<void> {
-  let clip: AudioClip<"1.0.0">;
-  try {
-    clip = ctx.getObjectFromHandle(handle, AudioClip);
-  } catch (err) {
-    await showResult(ctx, "Send to Wwise", "not an audio clip", "error",
-      `<p>Could not read the selected clip: <code>${(err as Error)?.message}</code></p>`);
-    return;
-  }
-
-  const filePath = clip.filePath;
-  const clipName = clip.name;
-  if (!filePath) {
-    await showResult(ctx, "Send to Wwise", "no source file", "error",
-      "<p>This clip has no source audio file to import.</p>");
-    return;
-  }
-
-  const storageDir = ctx.environment.storageDirectory;
-  const config = loadConfig(storageDir);
-
-  const formRaw = await ctx.ui.showModalDialog(transferFormUrl(config, clipName, filePath), 480, 440);
-  if (!formRaw) return; // cancelled
-
-  let req: WaapiConfig & { objectName: string };
-  try {
-    req = JSON.parse(formRaw);
-  } catch {
-    return;
-  }
-
-  // Remember connection + destination choices for next time.
-  saveConfig(storageDir, {
-    ...config,
-    host: req.host,
-    port: req.port,
-    parentPath: req.parentPath,
-    importLanguage: req.importLanguage,
-    importOperation: req.importOperation,
-  });
-
-  const outcome = await ctx.ui.withinProgressDialog(
-    "Transferring to Wwise…",
-    { progress: 0 },
-    async (update) => {
-      let client: WaapiClient | undefined;
-      try {
-        await update("Connecting to WAAPI…", 20);
-        client = await WaapiClient.connect({ host: req.host, port: req.port });
-        await update(`Importing “${req.objectName}”…`, 60);
-        const obj = await transferAudioToWwise(client, {
-          audioFile: filePath,
-          parentPath: req.parentPath,
-          objectName: req.objectName,
-          importLanguage: req.importLanguage,
-          importOperation: req.importOperation,
-        });
-        await update("Revealing in Wwise…", 90);
-        try {
-          await revealInWwise(client, obj.id);
-        } catch {
-          /* deep-link is best-effort */
-        }
-        return { ok: true as const, obj };
-      } catch (err) {
-        return { ok: false as const, message: (err as Error)?.message ?? String(err) };
-      } finally {
-        client?.close();
-      }
-    },
-  );
-
-  const res = outcome as { ok: true; obj: ImportedObject } | { ok: false; message: string };
-  if (res.ok) {
-    await showResult(ctx, "Sent to Wwise", "imported", "ok",
-      `<p>Created / updated in Wwise:</p>` +
-      `<p><code>${res.obj.path ?? res.obj.name ?? res.obj.id}</code></p>` +
-      `<p>Type: <code>${res.obj.type ?? "Sound"}</code></p>`);
-  } else {
-    await showResult(ctx, "Send to Wwise", "failed", "error",
-      `<p>Transfer failed:</p><p><code>${res.message}</code></p>`);
-  }
-}
-
-/** Diagnostic: WAMP session + ak.wwise.core.getInfo round-trip. */
-async function testConnection(ctx: Ctx): Promise<void> {
-  const config = loadConfig(ctx.environment.storageDirectory);
-  const outcome = await ctx.ui.withinProgressDialog(
-    "Connecting to WAAPI…",
-    { progress: 0 },
-    async (update) => {
-      let client: WaapiClient | undefined;
-      try {
-        client = await WaapiClient.connect({ host: config.host, port: config.port });
-        await update("Calling ak.wwise.core.getInfo…", 60);
-        const info = await client.call<{
-          version?: { displayName?: string; year?: number };
-          apiVersion?: number;
-        }>("ak.wwise.core.getInfo");
-        const v = info.version ?? {};
-        return {
-          ok: true as const,
-          body:
-            `<p>Connected to <code>${config.host}:${config.port}</code></p>` +
-            `<p>Wwise: <code>${v.displayName ?? "?"}</code> (${v.year ?? "?"}) · ` +
-            `apiVersion <code>${info.apiVersion ?? "?"}</code></p>`,
-        };
-      } catch (err) {
-        return { ok: false as const, body: `<p><code>${(err as Error)?.message ?? err}</code></p>` };
-      } finally {
-        client?.close();
-      }
-    },
-  );
-  const res = outcome as { ok: boolean; body: string };
-  await showResult(ctx, "WAAPI Connection", res.ok ? "connected" : "failed", res.ok ? "ok" : "error", res.body);
 }
 
 /** Arrangement View entry (`AudioTrack.ArrangementSelection`). */
@@ -214,6 +89,7 @@ async function runBatch(
         destination: config.parentPath,
         importOperation: config.importOperation,
         rename: config.batchRename,
+        container: config.container,
       },
       hierarchy.childrenByPath,
       hierarchy.offline,
@@ -223,7 +99,12 @@ async function runBatch(
   );
   if (!formRaw) return; // cancelled
 
-  let settings: { destination: string; importOperation: string; rename: BatchRenameSettings };
+  let settings: {
+    destination: string;
+    importOperation: string;
+    rename: BatchRenameSettings;
+    container: ContainerSettings;
+  };
   try {
     settings = JSON.parse(formRaw);
   } catch {
@@ -235,6 +116,7 @@ async function runBatch(
     parentPath: settings.destination,
     importOperation: settings.importOperation as ImportOperation,
     batchRename: settings.rename,
+    container: settings.container,
   });
 
   type ItemResult = { name: string; ok: boolean; path?: string; error?: string };
@@ -247,9 +129,16 @@ async function runBatch(
         await update("Connecting to WAAPI…", 5);
         client = await WaapiClient.connect({ host: config.host, port: config.port });
 
-        // Resume the index after existing matching objects at the destination.
+        // Resume the index after existing matching objects. When wrapping in a
+        // container, the sounds live inside it — so check the container's
+        // children (a fresh container has none → numbering from 0), not the
+        // destination's. WAQL paths carry no type tag, just the plain name.
         await update("Checking existing objects…", 12);
-        const childNames = await fetchChildNames(client, settings.destination);
+        const collisionParent =
+          settings.container.type !== "none" && settings.container.name.trim()
+            ? `${settings.destination}\\${sanitizeWwiseName(settings.container.name)}`
+            : settings.destination;
+        const childNames = await fetchChildNames(client, collisionParent);
         const start = resumeIndex(settings.rename, childNames);
         const entries = computeBatchNames(originals, settings.rename, start);
 
@@ -278,6 +167,7 @@ async function runBatch(
             const obj = await transferAudioToWwise(client, {
               audioFile: filePath,
               parentPath: settings.destination,
+              container: settings.container,
               objectName: name,
               importLanguage: config.importLanguage,
               importOperation: settings.importOperation as ImportOperation,
@@ -331,65 +221,12 @@ async function runBatch(
     `<ul style="padding-left:18px;max-height:240px;overflow:auto">${rows}</ul>`);
 }
 
-/** Phase 2a step 1 diagnostic: list Wwise import destinations via WAQL. */
-async function listDestinations(ctx: Ctx): Promise<void> {
-  const config = loadConfig(ctx.environment.storageDirectory);
-  const outcome = await ctx.ui.withinProgressDialog(
-    "Reading Wwise hierarchy…",
-    { progress: 0 },
-    async (update) => {
-      let client: WaapiClient | undefined;
-      try {
-        client = await WaapiClient.connect({ host: config.host, port: config.port });
-        await update("Querying ak.wwise.core.object.get…", 60);
-        const dests = await fetchDestinations(client);
-        return { ok: true as const, dests };
-      } catch (err) {
-        return { ok: false as const, message: (err as Error)?.message ?? String(err) };
-      } finally {
-        client?.close();
-      }
-    },
-  );
-
-  const res = outcome as
-    | { ok: true; dests: { path: string; type: string }[] }
-    | { ok: false; message: string };
-  if (!res.ok) {
-    await showResult(ctx, "Wwise Destinations", "failed", "error",
-      `<p><code>${res.message}</code></p>`);
-    return;
-  }
-  const shown = res.dests.slice(0, 100);
-  const rows = shown
-    .map((d) => `<li><code>${d.path}</code> <span style="opacity:.6">(${d.type})</span></li>`)
-    .join("");
-  const more = res.dests.length > shown.length ? `<p>…and ${res.dests.length - shown.length} more.</p>` : "";
-  await showResult(ctx, "Wwise Destinations", `${res.dests.length} found`,
-    res.dests.length > 0 ? "ok" : "warn",
-    (res.dests.length === 0
-      ? "<p>No container-capable destinations found. Is a project open?</p>"
-      : `<ul style="padding-left:18px;max-height:200px;overflow:auto">${rows}</ul>${more}`));
-}
-
 export function activate(activation: ActivationContext) {
   const ctx = initialize(activation, "1.0.0");
 
   if (!ctx.environment.storageDirectory) {
-    console.log("[live-to-wwise] No storage directory; config will not persist.");
+    console.log("[live-to-wwise] Host provided no storage directory; persisting to ~/.live-to-wwise instead.");
   }
-
-  ctx.commands.registerCommand("live-to-wwise.sendClip", (...args) => {
-    void sendClip(ctx, args[0] as Handle);
-  });
-
-  ctx.commands.registerCommand("live-to-wwise.testConnection", () => {
-    void testConnection(ctx);
-  });
-
-  ctx.commands.registerCommand("live-to-wwise.listDestinations", () => {
-    void listDestinations(ctx);
-  });
 
   ctx.commands.registerCommand("live-to-wwise.sendSelection", (...args) => {
     void sendSelection(ctx, args[0] as ArrangementSelection);
@@ -409,7 +246,4 @@ export function activate(activation: ActivationContext) {
     "Send to Wwise…",
     "live-to-wwise.sendClipSlots",
   );
-  ctx.ui.registerContextMenuAction("AudioClip", "Send to Wwise…", "live-to-wwise.sendClip");
-  ctx.ui.registerContextMenuAction("AudioClip", "Test WAAPI Connection", "live-to-wwise.testConnection");
-  ctx.ui.registerContextMenuAction("AudioClip", "List Wwise Destinations", "live-to-wwise.listDestinations");
 }
