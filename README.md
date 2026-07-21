@@ -2,7 +2,7 @@
 
 An Ableton Live extension that sends audio clips into a [Wwise](https://www.audiokinetic.com/)
 project over the Wwise Authoring API (WAAPI) — the Ableton counterpart to
-[ReaWwise](https://github.com/audiokinetic/ReaWwise) (REAPER → Wwise).
+ReaWwise.
 
 Select audio clips in Live, right-click **Send to Wwise…**, batch-rename them,
 pick a destination in the Wwise hierarchy, optionally wrap them in a container,
@@ -14,7 +14,7 @@ and import — all without leaving Live.
 
 ## Requirements
 
-- **Ableton Live** with the Extensions SDK / Extension Host (beta).
+- **Ableton Live 12.4.5** (currently in public beta).
 - **Wwise** open, with a project loaded and the **Authoring API enabled**
   (Wwise → *Project Settings*), listening on the default WAMP port **8080**.
 - **Node ≥ 24.14.1** (the Extension Host runtime) for building.
@@ -22,11 +22,12 @@ and import — all without leaving Live.
 Live and Wwise run on the same machine — the extension talks to
 `ws://127.0.0.1:8080/waapi`.
 
-## Install & run
+## Get Started
 
-**Install**: See `Release` Page.
+**Install to Live** 
+Download [Release](https://github.com/songdsp/live-to-wwise/releases/tag/Installer) and install in Ableton Settings - Extension.
 
-**Build:**
+**Build**
 ```bash
 npm install          # installs the vendored SDK + CLI from ./vendor
 npm start            # dev build + launch in the Extension Host (extensions-cli run)
