@@ -1,220 +1,415 @@
-import { initialize, type ActivationContext } from "@ableton-extensions/sdk";
 import {
-  probeWaapi,
-  DEFAULT_WAAPI_HOST,
-  DEFAULT_WAAPI_PORT,
-  type ProbeResult,
-} from "./waapi/probe.js";
-import { WebSocketClient, WAMP_SUBPROTOCOL } from "./waapi/websocket.js";
+  initialize,
+  AudioClip,
+  type ActivationContext,
+  type ArrangementSelection,
+  type ClipSlotSelection,
+  type ExtensionContext,
+  type Handle,
+} from "@ableton-extensions/sdk";
+import { resolveArrangementClips, resolveClipSlotClips } from "./live/selection.js";
+import { computeBatchNames, resumeIndex, type BatchRenameSettings } from "./live/rename.js";
 import { WaapiClient } from "./waapi/client.js";
+import { loadConfig, saveConfig, type WaapiConfig, type ImportOperation } from "./config.js";
+import { transferAudioToWwise, revealInWwise, setObjectNotes, type ImportedObject } from "./wwise/import.js";
+import { fetchHierarchy, fetchChildNames, fetchDestinations } from "./wwise/hierarchy.js";
+import { saveHierarchyCache, loadHierarchyCache } from "./wwise/cache.js";
+import { resultDialogUrl, transferFormUrl, batchFormUrl } from "./ui/dialogs.js";
 
-// esbuild inlines this HTML file as a string for production builds.
-import bundledInterface from "../ui/interface.html";
-
+type Ctx = ExtensionContext<"1.0.0">;
 type Tone = "ok" | "warn" | "error";
 
-/** Builds a data: URL for a simple colour-coded result modal. */
-function resultDialogUrl(title: string, badge: string, tone: Tone, body: string): string {
-  const color = tone === "ok" ? "#2e7d32" : tone === "warn" ? "#ef6c00" : "#c62828";
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
-<style>
-  body { font: 13px/1.5 -apple-system, system-ui, sans-serif; margin: 16px; color: #222; }
-  h1 { font-size: 15px; margin: 0 0 8px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; color: #fff;
-           background: ${color}; font-weight: 600; text-transform: uppercase; font-size: 11px; }
-  p { margin: 10px 0; } code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
-  button { margin-top: 12px; }
-</style></head><body>
-  <h1>${title} — <span class="badge">${badge}</span></h1>
-  ${body}
-  <button onclick="closeDialog()">Close</button>
-  <script>
-    function closeDialog() {
-      const msg = { method: "close_and_send", params: ["ok"] };
-      if (window.webkit?.messageHandlers?.live) window.webkit.messageHandlers.live.postMessage(msg);
-      else if (window.chrome?.webview) window.chrome.webview.postMessage(msg);
-    }
-  </script>
-</body></html>`;
-  return `data:text/html,${encodeURIComponent(html)}`;
+function showResult(ctx: Ctx, title: string, badge: string, tone: Tone, body: string): Promise<string> {
+  return ctx.ui.showModalDialog(resultDialogUrl(title, badge, tone, body), 480, 320);
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"]/g, (c) =>
+    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;");
+}
+
+function baseName(path: string): string {
+  const m = /[^/\\]+$/.exec(path);
+  return m ? m[0] : path;
+}
+
+/** Phase 1 — transfer a single audio clip's source file to Wwise. */
+async function sendClip(ctx: Ctx, handle: Handle): Promise<void> {
+  let clip: AudioClip<"1.0.0">;
+  try {
+    clip = ctx.getObjectFromHandle(handle, AudioClip);
+  } catch (err) {
+    await showResult(ctx, "Send to Wwise", "not an audio clip", "error",
+      `<p>Could not read the selected clip: <code>${(err as Error)?.message}</code></p>`);
+    return;
+  }
+
+  const filePath = clip.filePath;
+  const clipName = clip.name;
+  if (!filePath) {
+    await showResult(ctx, "Send to Wwise", "no source file", "error",
+      "<p>This clip has no source audio file to import.</p>");
+    return;
+  }
+
+  const storageDir = ctx.environment.storageDirectory;
+  const config = loadConfig(storageDir);
+
+  const formRaw = await ctx.ui.showModalDialog(transferFormUrl(config, clipName, filePath), 480, 440);
+  if (!formRaw) return; // cancelled
+
+  let req: WaapiConfig & { objectName: string };
+  try {
+    req = JSON.parse(formRaw);
+  } catch {
+    return;
+  }
+
+  // Remember connection + destination choices for next time.
+  saveConfig(storageDir, {
+    ...config,
+    host: req.host,
+    port: req.port,
+    parentPath: req.parentPath,
+    importLanguage: req.importLanguage,
+    importOperation: req.importOperation,
+  });
+
+  const outcome = await ctx.ui.withinProgressDialog(
+    "Transferring to Wwise…",
+    { progress: 0 },
+    async (update) => {
+      let client: WaapiClient | undefined;
+      try {
+        await update("Connecting to WAAPI…", 20);
+        client = await WaapiClient.connect({ host: req.host, port: req.port });
+        await update(`Importing “${req.objectName}”…`, 60);
+        const obj = await transferAudioToWwise(client, {
+          audioFile: filePath,
+          parentPath: req.parentPath,
+          objectName: req.objectName,
+          importLanguage: req.importLanguage,
+          importOperation: req.importOperation,
+        });
+        await update("Revealing in Wwise…", 90);
+        try {
+          await revealInWwise(client, obj.id);
+        } catch {
+          /* deep-link is best-effort */
+        }
+        return { ok: true as const, obj };
+      } catch (err) {
+        return { ok: false as const, message: (err as Error)?.message ?? String(err) };
+      } finally {
+        client?.close();
+      }
+    },
+  );
+
+  const res = outcome as { ok: true; obj: ImportedObject } | { ok: false; message: string };
+  if (res.ok) {
+    await showResult(ctx, "Sent to Wwise", "imported", "ok",
+      `<p>Created / updated in Wwise:</p>` +
+      `<p><code>${res.obj.path ?? res.obj.name ?? res.obj.id}</code></p>` +
+      `<p>Type: <code>${res.obj.type ?? "Sound"}</code></p>`);
+  } else {
+    await showResult(ctx, "Send to Wwise", "failed", "error",
+      `<p>Transfer failed:</p><p><code>${res.message}</code></p>`);
+  }
+}
+
+/** Diagnostic: WAMP session + ak.wwise.core.getInfo round-trip. */
+async function testConnection(ctx: Ctx): Promise<void> {
+  const config = loadConfig(ctx.environment.storageDirectory);
+  const outcome = await ctx.ui.withinProgressDialog(
+    "Connecting to WAAPI…",
+    { progress: 0 },
+    async (update) => {
+      let client: WaapiClient | undefined;
+      try {
+        client = await WaapiClient.connect({ host: config.host, port: config.port });
+        await update("Calling ak.wwise.core.getInfo…", 60);
+        const info = await client.call<{
+          version?: { displayName?: string; year?: number };
+          apiVersion?: number;
+        }>("ak.wwise.core.getInfo");
+        const v = info.version ?? {};
+        return {
+          ok: true as const,
+          body:
+            `<p>Connected to <code>${config.host}:${config.port}</code></p>` +
+            `<p>Wwise: <code>${v.displayName ?? "?"}</code> (${v.year ?? "?"}) · ` +
+            `apiVersion <code>${info.apiVersion ?? "?"}</code></p>`,
+        };
+      } catch (err) {
+        return { ok: false as const, body: `<p><code>${(err as Error)?.message ?? err}</code></p>` };
+      } finally {
+        client?.close();
+      }
+    },
+  );
+  const res = outcome as { ok: boolean; body: string };
+  await showResult(ctx, "WAAPI Connection", res.ok ? "connected" : "failed", res.ok ? "ok" : "error", res.body);
+}
+
+/** Arrangement View entry (`AudioTrack.ArrangementSelection`). */
+async function sendSelection(ctx: Ctx, selection: ArrangementSelection): Promise<void> {
+  await runBatch(ctx, resolveArrangementClips(ctx, selection), "arrangement selection");
+}
+
+/** Session View entry (`ClipSlotSelection`). */
+async function sendClipSlots(ctx: Ctx, selection: ClipSlotSelection): Promise<void> {
+  await runBatch(ctx, resolveClipSlotClips(ctx, selection), "clip-slot selection");
+}
+
+/**
+ * Phase 2a: batch-transfer a set of audio clips — fetch destinations (cached
+ * fallback), show the batch form with live rename preview, rename the clips in
+ * Live as one undo step, then transfer each with provenance and a summary.
+ */
+async function runBatch(
+  ctx: Ctx,
+  clips: AudioClip<"1.0.0">[],
+  sourceLabel: string,
+): Promise<void> {
+  if (clips.length === 0) {
+    await showResult(ctx, "Send to Wwise", "no clips", "warn",
+      `<p>No audio clips found in the ${sourceLabel}.</p>`);
+    return;
+  }
+
+  const config = loadConfig(ctx.environment.storageDirectory);
+  const storageDir = ctx.environment.storageDirectory;
+  const originals = clips.map((c) => c.name);
+
+  // Fetch destinations + children up front (the sandboxed form can't call
+  // WAAPI). Cache on success; on failure fall back to the cached hierarchy.
+  const hierarchy = (await ctx.ui.withinProgressDialog(
+    "Reading Wwise destinations…",
+    { progress: 0 },
+    async () => {
+      let client: WaapiClient | undefined;
+      try {
+        client = await WaapiClient.connect({ host: config.host, port: config.port });
+        const h = await fetchHierarchy(client);
+        saveHierarchyCache(storageDir, h);
+        return { ...h, offline: false };
+      } catch (err) {
+        console.log(`[live-to-wwise] destination fetch failed: ${(err as Error)?.message}`);
+        const cached = loadHierarchyCache(storageDir);
+        return cached
+          ? { ...cached, offline: true }
+          : { destinations: [] as string[], childrenByPath: {} as Record<string, string[]>, offline: true };
+      } finally {
+        client?.close();
+      }
+    },
+  )) as { destinations: string[]; childrenByPath: Record<string, string[]>; offline: boolean };
+
+  const formRaw = await ctx.ui.showModalDialog(
+    batchFormUrl(
+      originals,
+      hierarchy.destinations,
+      {
+        destination: config.parentPath,
+        importOperation: config.importOperation,
+        rename: config.batchRename,
+      },
+      hierarchy.childrenByPath,
+      hierarchy.offline,
+    ),
+    560,
+    580,
+  );
+  if (!formRaw) return; // cancelled
+
+  let settings: { destination: string; importOperation: string; rename: BatchRenameSettings };
+  try {
+    settings = JSON.parse(formRaw);
+  } catch {
+    return;
+  }
+
+  saveConfig(ctx.environment.storageDirectory, {
+    ...config,
+    parentPath: settings.destination,
+    importOperation: settings.importOperation as ImportOperation,
+    batchRename: settings.rename,
+  });
+
+  type ItemResult = { name: string; ok: boolean; path?: string; error?: string };
+  const outcome = await ctx.ui.withinProgressDialog(
+    "Transferring to Wwise…",
+    { progress: 0 },
+    async (update) => {
+      let client: WaapiClient | undefined;
+      try {
+        await update("Connecting to WAAPI…", 5);
+        client = await WaapiClient.connect({ host: config.host, port: config.port });
+
+        // Resume the index after existing matching objects at the destination.
+        await update("Checking existing objects…", 12);
+        const childNames = await fetchChildNames(client, settings.destination);
+        const start = resumeIndex(settings.rename, childNames);
+        const entries = computeBatchNames(originals, settings.rename, start);
+
+        // Rename the clips in Live as a single undo step.
+        await update("Renaming clips in Live…", 20);
+        ctx.withinTransaction(() => {
+          entries.forEach((e, i) => {
+            if (clips[i].name !== e.newName) clips[i].name = e.newName;
+          });
+        });
+
+        // Transfer each clip; continue past failures and report per item.
+        const results: ItemResult[] = [];
+        const importedIds: string[] = [];
+        for (let i = 0; i < clips.length; i++) {
+          const name = entries[i].newName;
+          const pct = 25 + Math.round((i / clips.length) * 70);
+          await update(`Importing ${i + 1}/${clips.length}: ${name}`, pct);
+
+          const filePath = clips[i].filePath;
+          if (!filePath) {
+            results.push({ name, ok: false, error: "no source file" });
+            continue;
+          }
+          try {
+            const obj = await transferAudioToWwise(client, {
+              audioFile: filePath,
+              parentPath: settings.destination,
+              objectName: name,
+              importLanguage: config.importLanguage,
+              importOperation: settings.importOperation as ImportOperation,
+            });
+            importedIds.push(obj.id);
+            try {
+              await setObjectNotes(client, obj.id, `live-to-wwise · source: ${filePath} · clip: ${name}`);
+            } catch {
+              /* notes are best-effort */
+            }
+            results.push({ name, ok: true, path: obj.path });
+          } catch (err) {
+            results.push({ name, ok: false, error: (err as Error)?.message ?? String(err) });
+          }
+        }
+
+        if (importedIds.length > 0) {
+          await update("Revealing in Wwise…", 97);
+          try {
+            await revealInWwise(client, importedIds);
+          } catch {
+            /* deep-link best-effort */
+          }
+        }
+        return { results };
+      } catch (err) {
+        return { fatal: (err as Error)?.message ?? String(err) };
+      } finally {
+        client?.close();
+      }
+    },
+  );
+
+  const res = outcome as { results?: ItemResult[]; fatal?: string };
+  if (res.fatal || !res.results) {
+    await showResult(ctx, "Batch transfer", "failed", "error",
+      `<p><code>${escapeHtml(res.fatal ?? "unknown error")}</code></p>`);
+    return;
+  }
+  const results = res.results;
+  const okCount = results.filter((r) => r.ok).length;
+  const rows = results
+    .map((r) =>
+      r.ok
+        ? `<li>✓ <code>${escapeHtml(r.path ?? r.name)}</code></li>`
+        : `<li>✗ <code>${escapeHtml(r.name)}</code> — ${escapeHtml(r.error ?? "")}</li>`)
+    .join("");
+  await showResult(ctx, "Batch transfer", `${okCount}/${results.length} sent`,
+    okCount === results.length ? "ok" : "warn",
+    `<p>Destination <code>${escapeHtml(settings.destination)}</code></p>` +
+    `<ul style="padding-left:18px;max-height:240px;overflow:auto">${rows}</ul>`);
+}
+
+/** Phase 2a step 1 diagnostic: list Wwise import destinations via WAQL. */
+async function listDestinations(ctx: Ctx): Promise<void> {
+  const config = loadConfig(ctx.environment.storageDirectory);
+  const outcome = await ctx.ui.withinProgressDialog(
+    "Reading Wwise hierarchy…",
+    { progress: 0 },
+    async (update) => {
+      let client: WaapiClient | undefined;
+      try {
+        client = await WaapiClient.connect({ host: config.host, port: config.port });
+        await update("Querying ak.wwise.core.object.get…", 60);
+        const dests = await fetchDestinations(client);
+        return { ok: true as const, dests };
+      } catch (err) {
+        return { ok: false as const, message: (err as Error)?.message ?? String(err) };
+      } finally {
+        client?.close();
+      }
+    },
+  );
+
+  const res = outcome as
+    | { ok: true; dests: { path: string; type: string }[] }
+    | { ok: false; message: string };
+  if (!res.ok) {
+    await showResult(ctx, "Wwise Destinations", "failed", "error",
+      `<p><code>${res.message}</code></p>`);
+    return;
+  }
+  const shown = res.dests.slice(0, 100);
+  const rows = shown
+    .map((d) => `<li><code>${d.path}</code> <span style="opacity:.6">(${d.type})</span></li>`)
+    .join("");
+  const more = res.dests.length > shown.length ? `<p>…and ${res.dests.length - shown.length} more.</p>` : "";
+  await showResult(ctx, "Wwise Destinations", `${res.dests.length} found`,
+    res.dests.length > 0 ? "ok" : "warn",
+    (res.dests.length === 0
+      ? "<p>No container-capable destinations found. Is a project open?</p>"
+      : `<ul style="padding-left:18px;max-height:200px;overflow:auto">${rows}</ul>${more}`));
 }
 
 export function activate(activation: ActivationContext) {
-  const context = initialize(activation, "1.0.0");
+  const ctx = initialize(activation, "1.0.0");
 
-  // Phase 0 — Stage A: can the host reach the WAAPI port over raw TCP?
-  context.commands.registerCommand("live-to-wwise.testWaapi", () => {
-    void context.ui
-      .withinProgressDialog(
-        `Probing WAAPI (${DEFAULT_WAAPI_HOST}:${DEFAULT_WAAPI_PORT})…`,
-        { progress: 0 },
-        async () => {
-          const result = await probeWaapi();
-          console.log(`[live-to-wwise] Stage A: ${result.outcome} — ${result.message}`);
-          return result;
-        },
-      )
-      .then((raw) => {
-        const result = raw as ProbeResult;
-        const tone: Tone = result.outcome === "connected" ? "ok" : result.socketsAllowed ? "warn" : "error";
-        const body = `<p>Target: <code>${result.host}:${result.port}</code></p><p>${result.message}</p>`;
-        void context.ui.showModalDialog(
-          resultDialogUrl("WAAPI TCP Probe", result.outcome, tone, body),
-          440,
-          260,
-        );
-      });
+  if (!ctx.environment.storageDirectory) {
+    console.log("[live-to-wwise] No storage directory; config will not persist.");
+  }
+
+  ctx.commands.registerCommand("live-to-wwise.sendClip", (...args) => {
+    void sendClip(ctx, args[0] as Handle);
   });
 
-  // Phase 0 — Stage B: upgrade to a WebSocket at /waapi (expect HTTP 101).
-  context.commands.registerCommand("live-to-wwise.testWaapiWs", () => {
-    void context.ui
-      .withinProgressDialog(
-        `WebSocket handshake to ${DEFAULT_WAAPI_HOST}:${DEFAULT_WAAPI_PORT}/waapi…`,
-        { progress: 0 },
-        async () => {
-          try {
-            const ws = await WebSocketClient.connect({
-              host: DEFAULT_WAAPI_HOST,
-              port: DEFAULT_WAAPI_PORT,
-              path: "/waapi",
-              subprotocol: WAMP_SUBPROTOCOL,
-            });
-            const { statusLine, subprotocol, acceptValid } = ws.handshake;
-            ws.close();
-            console.log(`[live-to-wwise] Stage B: 101 OK — ${statusLine} (subprotocol=${subprotocol})`);
-            return {
-              ok: true as const,
-              body:
-                `<p><code>${statusLine}</code></p>` +
-                `<p>Accept header valid: <code>${acceptValid}</code><br>` +
-                `Negotiated subprotocol: <code>${subprotocol ?? "(none)"}</code></p>` +
-                `<p>The Extension Host can open a WebSocket to WAAPI. Ready for Stage C (WAMP + getInfo).</p>`,
-            };
-          } catch (err) {
-            const message = (err as Error)?.message ?? String(err);
-            console.log(`[live-to-wwise] Stage B failed: ${message}`);
-            return {
-              ok: false as const,
-              body: `<p>Handshake failed:</p><p><code>${message}</code></p>` +
-                `<p>If Stage A connected but this fails, the port is open but not a WAAPI WebSocket — ` +
-                `check that Wwise's Authoring API is enabled and using WAMP on this port.</p>`,
-            };
-          }
-        },
-      )
-      .then((raw) => {
-        const result = raw as { ok: boolean; body: string };
-        void context.ui.showModalDialog(
-          resultDialogUrl(
-            "WAAPI WebSocket",
-            result.ok ? "101 switching protocols" : "failed",
-            result.ok ? "ok" : "error",
-            result.body,
-          ),
-          460,
-          280,
-        );
-      });
+  ctx.commands.registerCommand("live-to-wwise.testConnection", () => {
+    void testConnection(ctx);
   });
 
-  // Phase 0 — Stage C: WAMP session + ak.wwise.core.getInfo round-trip.
-  context.commands.registerCommand("live-to-wwise.testWaapiInfo", () => {
-    void context.ui
-      .withinProgressDialog("Connecting to WAAPI (WAMP)…", { progress: 0 }, async (update) => {
-        let client: WaapiClient | undefined;
-        try {
-          client = await WaapiClient.connect({
-            host: DEFAULT_WAAPI_HOST,
-            port: DEFAULT_WAAPI_PORT,
-          });
-          await update("Calling ak.wwise.core.getInfo…", 50);
-          const info = await client.call<{
-            version?: { displayName?: string; year?: number; schemaVersion?: number };
-            apiVersion?: number;
-          }>("ak.wwise.core.getInfo");
-
-          // Best-effort: project info only succeeds when a project is open.
-          let projectLine = "";
-          try {
-            const project = await client.call<{ name?: string; path?: string }>(
-              "ak.wwise.core.getProjectInfo",
-            );
-            if (project?.name) {
-              projectLine = `<p>Project: <code>${project.name}</code><br>` +
-                `<code>${project.path ?? ""}</code></p>`;
-            }
-          } catch {
-            projectLine = "<p><em>No project info (is a project open?).</em></p>";
-          }
-
-          const v = info.version ?? {};
-          console.log(
-            `[live-to-wwise] Stage C: getInfo OK — ${v.displayName} (apiVersion=${info.apiVersion}, schema=${v.schemaVersion})`,
-          );
-          return {
-            ok: true as const,
-            body:
-              `<p>Wwise: <code>${v.displayName ?? "?"}</code> (${v.year ?? "?"})</p>` +
-              `<p>WAAPI apiVersion: <code>${info.apiVersion ?? "?"}</code> · ` +
-              `schema: <code>${v.schemaVersion ?? "?"}</code></p>` +
-              projectLine +
-              `<p><strong>Go.</strong> Full WAAPI round-trip works from the Extension Host — Phase 1 is unblocked.</p>`,
-          };
-        } catch (err) {
-          const message = (err as Error)?.message ?? String(err);
-          console.log(`[live-to-wwise] Stage C failed: ${message}`);
-          return {
-            ok: false as const,
-            body: `<p>WAMP round-trip failed:</p><p><code>${message}</code></p>`,
-          };
-        } finally {
-          client?.close();
-        }
-      })
-      .then((raw) => {
-        const result = raw as { ok: boolean; body: string };
-        void context.ui.showModalDialog(
-          resultDialogUrl(
-            "WAAPI getInfo",
-            result.ok ? "connected" : "failed",
-            result.ok ? "ok" : "error",
-            result.body,
-          ),
-          480,
-          320,
-        );
-      });
+  ctx.commands.registerCommand("live-to-wwise.listDestinations", () => {
+    void listDestinations(ctx);
   });
 
-  context.commands.registerCommand("live-to-wwise.showDialog", () => {
-    const url = `data:text/html,${encodeURIComponent(bundledInterface)}`;
-    context.ui.showModalDialog(url, 320, 160).then((result) => {
-      console.log(`Dialog closed with: ${result}`);
-    });
+  ctx.commands.registerCommand("live-to-wwise.sendSelection", (...args) => {
+    void sendSelection(ctx, args[0] as ArrangementSelection);
   });
 
-  context.ui.registerContextMenuAction(
-    "AudioClip",
-    "live-to-wwise: Test WAAPI Connection (TCP)",
-    "live-to-wwise.testWaapi",
-  );
+  ctx.commands.registerCommand("live-to-wwise.sendClipSlots", (...args) => {
+    void sendClipSlots(ctx, args[0] as ClipSlotSelection);
+  });
 
-  context.ui.registerContextMenuAction(
-    "AudioClip",
-    "live-to-wwise: Test WAAPI WebSocket",
-    "live-to-wwise.testWaapiWs",
+  ctx.ui.registerContextMenuAction(
+    "AudioTrack.ArrangementSelection",
+    "Send to Wwise…",
+    "live-to-wwise.sendSelection",
   );
-
-  context.ui.registerContextMenuAction(
-    "AudioClip",
-    "live-to-wwise: Test WAAPI getInfo (WAMP)",
-    "live-to-wwise.testWaapiInfo",
+  ctx.ui.registerContextMenuAction(
+    "ClipSlotSelection",
+    "Send to Wwise…",
+    "live-to-wwise.sendClipSlots",
   );
-
-  context.ui.registerContextMenuAction(
-    "AudioClip",
-    "Open live-to-wwise",
-    "live-to-wwise.showDialog",
-  );
+  ctx.ui.registerContextMenuAction("AudioClip", "Send to Wwise…", "live-to-wwise.sendClip");
+  ctx.ui.registerContextMenuAction("AudioClip", "Test WAAPI Connection", "live-to-wwise.testConnection");
+  ctx.ui.registerContextMenuAction("AudioClip", "List Wwise Destinations", "live-to-wwise.listDestinations");
 }

@@ -67,24 +67,31 @@ process / WwiseConsole script (`ak.wwise.core.audio.importTabDelimited`).
 
 ## Phases
 
-### Phase 0 — Connectivity spike *(current)*
-Prove the extension host can reach WAAPI. See
+### Phase 0 — Connectivity spike ✅ *(done — Go)*
+Proved the extension host can reach WAAPI end-to-end. See
 [phase-0-waapi-connectivity.md](./phase-0-waapi-connectivity.md).
 - Stage A: `node:net` availability + raw TCP connect to `127.0.0.1:8080` (the sandbox gate).
 - Stage B: WebSocket upgrade handshake to `/waapi`.
 - Stage C: WAMP HELLO→WELCOME, then `ak.wwise.core.getInfo` round-trip.
 - Confirm `renderPreFxAudio` output format and constraints.
 
-### Phase 1 — MVP: "Send clip to Wwise"
-- Connect panel: host/port, test connection, persist to `storageDirectory`.
-- Single audio-clip transfer from the `AudioClip` context menu → render region → `audio.import` as `<Sound SFX>`.
-- Import-operation choice; progress via `withinProgressDialog`; deep-link into Wwise via `ui.commands.execute`.
+### Phase 1 — MVP: "Send clip to Wwise" 🚧 *(current)*
+- Connect panel: host/port, test connection, persist to `storageDirectory`. ✅
+- Single audio-clip transfer from the `AudioClip` context menu → `audio.import` as `<Sound SFX>`. ✅
+  (MVP imports `AudioClip.filePath`; region/FX render deferred to Phase 2/3.)
+- Import-operation choice; progress via `withinProgressDialog`; deep-link into Wwise via `ui.commands.execute`. ✅
+- End-to-end verification in Live + Wwise. ⬜
 
-### Phase 2 — Hierarchy mapping & batch
-- Batch transfer over `ArrangementSelection` / `ClipSlotSelection`.
+### Phase 2a — Batch, rename-in-Live & destination picker *(next)*
+See [phase-2a-batch-and-destination.md](./phase-2a-batch-and-destination.md).
+- Batch transfer over `ClipSlotSelection` / `ArrangementSelection`.
+- Rename clips **in Ableton first** (`Clip.name`, one undo step) → name flows to Wwise.
+- Wwise destination dropdown from `ak.wwise.core.object.get` (WAQL), cached + free-text fallback.
+
+### Phase 2b — Hierarchy mapping, preview & containers
 - Hierarchy Mapping Table with tokens (`$track`, `$clip`, `$scene`, `$color`, `$group`) → type-tagged `objectPath`.
 - Preview panel (files + objects to be created/replaced) before commit.
-- Originals subfolder + import destination; named presets.
+- Originals subfolder; named presets.
 - Container templates (Random/Sequence/Switch/Blend) via `object.create`.
 
 ### Phase 3 — Metadata-rich transfer
